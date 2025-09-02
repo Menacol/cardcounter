@@ -72,6 +72,17 @@ class SessionState:
 	observed_this_hand: Set[Tuple[int, str]] = field(default_factory=set)
 	lock: threading.Lock = field(default_factory=threading.Lock)
 	stop_event: threading.Event = field(default_factory=threading.Event)
+	tracks: List["RoiTrack"] = field(default_factory=list)
+
+
+@dataclass
+class RoiTrack:
+	# True when a rank is currently visible for this ROI
+	is_visible: bool = False
+	# The last accepted rank while visible
+	current_rank: Optional[str] = None
+	# Consecutive frames without a confident rank
+	miss_count: int = 0
 
 
 def draw_rois_on_image(img: np.ndarray, rois: List[Roi]) -> np.ndarray:
@@ -143,39 +154,84 @@ def grab_screen(monitor: dict) -> np.ndarray:
 
 
 def preprocess_for_rank(gray: np.ndarray) -> np.ndarray:
-	# Increase contrast and threshold to emphasize rank glyphs
+	# Legacy single-path preprocessing retained for compatibility
 	blur = cv2.GaussianBlur(gray, (3, 3), 0)
 	thr = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 21, 7)
 	return thr
 
 
-def ocr_rank(crop: np.ndarray) -> Optional[str]:
-	if not _TESS_AVAILABLE:
+def _generate_ocr_variants(corner_bgr: np.ndarray) -> List[np.ndarray]:
+	# Prepare multiple preprocessing variants; return list of binary or high-contrast images
+	gray = cv2.cvtColor(corner_bgr, cv2.COLOR_BGR2GRAY)
+	# Upscale to help Tesseract with small glyphs
+	gray_up = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+	# Contrast Limited Adaptive Histogram Equalization (CLAHE)
+	clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+	clahe_up = clahe.apply(gray_up)
+	# Denoise and sharpen
+	blur = cv2.GaussianBlur(clahe_up, (3, 3), 0)
+	sharpen = cv2.addWeighted(clahe_up, 1.5, blur, -0.5, 0)
+	# Threshold variants
+	_, otsu_inv = cv2.threshold(sharpen, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+	ada_inv = cv2.adaptiveThreshold(sharpen, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7)
+	# Morphology variants to clean small noise
+	kernel = np.ones((2, 2), np.uint8)
+	close = cv2.morphologyEx(otsu_inv, cv2.MORPH_CLOSE, kernel, iterations=1)
+	open_ = cv2.morphologyEx(ada_inv, cv2.MORPH_OPEN, kernel, iterations=1)
+	return [clahe_up, sharpen, otsu_inv, ada_inv, close, open_]
+
+
+def _parse_rank(text: str) -> Optional[str]:
+	text = text.strip().upper().replace("O", "0")
+	if not text:
 		return None
+	# Normalize obvious shapes
+	if text in {"J", "Q", "K", "A"}:
+		return text
+	if "10" in text or text == "IO":
+		return "10"
+	# Single digit 2-9
+	if text[0:1] in list("23456789"):
+		return text[0]
+	return None
+
+
+def ocr_rank_with_conf(crop: np.ndarray) -> Tuple[Optional[str], int]:
+	if not _TESS_AVAILABLE:
+		return None, -1
 	# Focus on top-left corner where rank is usually displayed
 	h, w = crop.shape[:2]
 	corner = crop[0:int(h * 0.35), 0:int(w * 0.35)]
-	gray = cv2.cvtColor(corner, cv2.COLOR_BGR2GRAY)
-	thr = preprocess_for_rank(gray)
-	pil = Image.fromarray(thr)
-	try:
-		text = pytesseract.image_to_string(
-			pil,
-			config='--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789JQKA'
-		)
-		text = text.strip().upper().replace("O", "0")
-		# Normalize to rank symbol
-		if text in {"J", "Q", "K", "A"}:
-			return text
-		# Try to parse 10 specially
-		if "10" in text or text == "IO":
-			return "10"
-		# Single digit 2-9
-		if len(text) >= 1 and text[0] in list("23456789"):
-			return text[0]
-		return None
-	except Exception:
-		return None
+	# Try multiple preprocessing variants and PSM modes; choose the best by confidence
+	variants = _generate_ocr_variants(corner)
+	psm_modes = [7, 10]
+	best: Optional[str] = None
+	best_conf: int = -1
+	for img in variants:
+		pil = Image.fromarray(img)
+		for psm in psm_modes:
+			try:
+				cfg = f"--psm {psm} --oem 3 -c tessedit_char_whitelist=0123456789JQKA"
+				data = pytesseract.image_to_data(pil, config=cfg, output_type=pytesseract.Output.DICT)
+				for i in range(len(data.get("text", []))):
+					raw = data["text"][i]
+					conf = int(float(data.get("conf", ["-1"][0])[i])) if "conf" in data else -1
+					rank = _parse_rank(raw)
+					if rank is None:
+						continue
+					if conf > best_conf:
+						best_conf = conf
+						best = rank
+						if conf >= 80:
+							return best, best_conf
+			except Exception:
+				continue
+	return best, best_conf
+
+
+def ocr_rank(crop: np.ndarray) -> Optional[str]:
+	rank, _ = ocr_rank_with_conf(crop)
+	return rank
 
 
 def rank_to_count_delta(rank: str) -> int:
@@ -192,27 +248,48 @@ def format_counts(shoe: ShoeState) -> str:
 
 
 def observe_loop(cfg: SessionConfig, state: SessionState) -> None:
+	# thresholds
+	min_accept_conf = 65
+	misses_to_clear = 2
 	interval = 1.0 / max(0.1, cfg.poll_hz)
 	with mss() as sct:
 		while not state.stop_event.is_set():
 			for idx, roi in enumerate(state.rois):
 				img = np.array(sct.grab(roi.to_mss()))[:, :, :3]
-				rank = ocr_rank(img) if cfg.use_ocr else None
+				rank, conf = (ocr_rank_with_conf(img) if cfg.use_ocr else (None, -1))
 				if cfg.debug:
 					debug_show = img.copy()
 					cv2.imshow(f"roi_{idx}", debug_show)
 					cv2.waitKey(1)
-				if rank is None:
-					continue
 				with state.lock:
-					key = (idx, rank)
-					if key in state.observed_this_hand:
+					# Ensure tracks list is sized
+					if len(state.tracks) != len(state.rois):
+						needed = len(state.rois) - len(state.tracks)
+						if needed > 0:
+							state.tracks.extend(RoiTrack() for _ in range(needed))
+						elif needed < 0:
+							state.tracks = state.tracks[:len(state.rois)]
+					tr = state.tracks[idx]
+					# Handle detection result
+					if rank is None or conf < min_accept_conf:
+						tr.miss_count += 1
+						if tr.miss_count >= misses_to_clear:
+							tr.is_visible = False
+							tr.current_rank = None
 						continue
-					state.observed_this_hand.add(key)
-					state.shoe.seen_cards += 1
-					delta = rank_to_count_delta(rank)
-					state.shoe.running_count += delta
-					print(f"Observed {rank} at pos {idx}: {format_counts(state.shoe)}")
+					# We have a confident rank
+					tr.miss_count = 0
+					if not tr.is_visible:
+						# Treat as a new appearance -> accept exactly once
+						tr.is_visible = True
+						tr.current_rank = rank
+						state.shoe.seen_cards += 1
+						delta = rank_to_count_delta(rank)
+						state.shoe.running_count += delta
+						print(f"Observed {rank} at pos {idx}: {format_counts(state.shoe)}")
+					else:
+						# Already visible; ignore until it disappears first
+						tr.current_rank = rank
 			time.sleep(interval)
 	if cfg.debug:
 		cv2.destroyAllWindows()
@@ -225,7 +302,7 @@ def run_gui(cfg: SessionConfig, state: SessionState) -> None:
 		return
 	root = tk.Tk()
 	root.title("Blackjack Counter")
-	root.geometry("360x220")
+	root.geometry("520x260")
 
 	counts_var = tk.StringVar(value=format_counts(state.shoe))
 	status_label = ttk.Label(root, textvariable=counts_var, font=("Segoe UI", 12))
@@ -239,13 +316,19 @@ def run_gui(cfg: SessionConfig, state: SessionState) -> None:
 
 	def on_new_hand():
 		with state.lock:
-			state.observed_this_hand.clear()
+			for tr in state.tracks:
+				tr.is_visible = False
+				tr.current_rank = None
+				tr.miss_count = 0
 
 	def on_new_shoe():
 		with state.lock:
 			state.shoe.seen_cards = 0
 			state.shoe.running_count = 0
-			state.observed_this_hand.clear()
+			for tr in state.tracks:
+				tr.is_visible = False
+				tr.current_rank = None
+				tr.miss_count = 0
 
 	def on_toggle_ocr():
 		cfg.use_ocr = not cfg.use_ocr
@@ -255,24 +338,25 @@ def run_gui(cfg: SessionConfig, state: SessionState) -> None:
 		state.stop_event.set()
 		root.destroy()
 
-	btn_frame = ttk.Frame(root)
-	btn_frame.pack(pady=8)
+	# Top toolbar with single-row buttons
+	toolbar = ttk.Frame(root)
+	toolbar.pack(pady=6)
 
-	ocr_btn = ttk.Button(btn_frame, text=f"OCR: {'On' if cfg.use_ocr else 'Off'}", command=on_toggle_ocr)
-	ocr_btn.grid(row=0, column=0, padx=5, pady=5)
+	ocr_btn = ttk.Button(toolbar, text=f"OCR: {'On' if cfg.use_ocr else 'Off'}", command=on_toggle_ocr)
+	ocr_btn.grid(row=0, column=0, padx=5, pady=4)
 
-	new_hand_btn = ttk.Button(btn_frame, text="New Hand", command=on_new_hand)
-	new_hand_btn.grid(row=0, column=1, padx=5, pady=5)
+	new_hand_btn = ttk.Button(toolbar, text="🃏 New Hand", command=on_new_hand)
+	new_hand_btn.grid(row=0, column=1, padx=5, pady=4)
 
-	new_shoe_btn = ttk.Button(btn_frame, text="New Shoe", command=on_new_shoe)
-	new_shoe_btn.grid(row=0, column=2, padx=5, pady=5)
+	new_shoe_btn = ttk.Button(toolbar, text="🂠 New Shoe", command=on_new_shoe)
+	new_shoe_btn.grid(row=0, column=2, padx=5, pady=4)
 
-	quit_btn = ttk.Button(root, text="Quit", command=on_quit)
-	quit_btn.pack(pady=10)
+	quit_btn = ttk.Button(toolbar, text="✖ Quit", command=on_quit)
+	quit_btn.grid(row=0, column=3, padx=5, pady=4)
 
-	# Manual rank buttons
+	# Manual rank buttons in a single horizontal row with icons
 	manual_frame = ttk.LabelFrame(root, text="Add Card (Manual)")
-	manual_frame.pack(pady=6)
+	manual_frame.pack(pady=6, fill="x")
 
 	manual_ranks = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
 	def on_add(rank: str):
@@ -280,9 +364,20 @@ def run_gui(cfg: SessionConfig, state: SessionState) -> None:
 			state.shoe.seen_cards += 1
 			state.shoe.running_count += rank_to_count_delta(rank)
 
+	# Create a horizontally scrollable area
+	canvas = tk.Canvas(manual_frame, height=44, highlightthickness=0)
+	xscroll = ttk.Scrollbar(manual_frame, orient="horizontal", command=canvas.xview)
+	buttons_holder = ttk.Frame(canvas)
+	buttons_holder.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+	canvas.create_window((0, 0), window=buttons_holder, anchor="nw")
+	canvas.configure(xscrollcommand=xscroll.set)
+	canvas.pack(fill="x")
+	xscroll.pack(fill="x")
+
 	for i, r in enumerate(manual_ranks):
-		btn = ttk.Button(manual_frame, text=r, width=3, command=lambda rr=r: on_add(rr))
-		btn.grid(row=i // 7, column=i % 7, padx=3, pady=3)
+		label = f"🂠 {r}"
+		btn = ttk.Button(buttons_holder, text=label, width=5, command=lambda rr=r: on_add(rr))
+		btn.grid(row=0, column=i, padx=4, pady=6)
 
 	info = ttk.Label(root, text="Controls: Select ROIs on start. GUI updates live.", font=("Segoe UI", 9))
 	info.pack(pady=4)
@@ -304,14 +399,20 @@ def manual_input_loop(state: SessionState) -> None:
 			break
 		if line in {"/H", "/HAND"}:
 			with state.lock:
-				state.observed_this_hand.clear()
+				for tr in state.tracks:
+					tr.is_visible = False
+					tr.current_rank = None
+					tr.miss_count = 0
 			print("New hand.")
 			continue
 		if line in {"/S", "/SHOE"}:
 			with state.lock:
 				state.shoe.seen_cards = 0
 				state.shoe.running_count = 0
-				state.observed_this_hand.clear()
+				for tr in state.tracks:
+					tr.is_visible = False
+					tr.current_rank = None
+					tr.miss_count = 0
 			print("New shoe counters reset.")
 			continue
 		# Parse ranks possibly separated by spaces/commas
